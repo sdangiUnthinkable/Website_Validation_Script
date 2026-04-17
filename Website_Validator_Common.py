@@ -55,7 +55,7 @@ def normalize_url(url):
     return hostname.split('.')[0]
 
 
-async def check(session, url, account_id, retries=3):
+async def check(session, url, retries=3):
     original_url = url
     url = ensure_scheme(url)
     for attempt in range(retries + 1):
@@ -87,7 +87,7 @@ async def check(session, url, account_id, retries=3):
             "createddate": datetime.now()}
 
 
-def sync_check_fallback(url, account_id):
+def sync_check_fallback(url):
     try:
         response = requests.get(ensure_scheme(url), timeout=25, verify=False)
         return {"website": url, "status": f"Working {response.status_code}", "redirect_url": None,
