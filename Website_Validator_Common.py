@@ -4,173 +4,156 @@ import asyncio
 import aiohttp
 import nest_asyncio
 import requests
-import re
-import os
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from requests.exceptions import SSLError, RequestException
 from yarl import URL
 from datetime import datetime
 
-# Required to run async loops inside the Streamlit web server
+# Required for async logic within Streamlit
 nest_asyncio.apply()
 
 # --- CONFIGURATION ---
-BATCH_SIZE = 2500
-MAX_RECORDS = 100000
-CONCURRENCY = 150  # Lowered slightly for web stability
-TIMEOUT = 40
-
+CONCURRENCY = 100 
+TIMEOUT = 30
 
 # --- UTILITY FUNCTIONS ---
 
 def ensure_scheme(url):
     try:
+        if not url or pd.isna(url): return None
+        url = str(url).strip()
         parsed = URL(url)
         if not parsed.scheme:
             return f"https://{url}"
-        elif parsed.scheme == "http":
-            return str(parsed.with_scheme("https"))
         return url
     except Exception:
         return url
-
-
-async def dns_resolves(url):
-    try:
-        host = URL(url).host
-        loop = asyncio.get_event_loop()
-        await loop.getaddrinfo(host, None)
-        return True
-    except Exception:
-        return False
-
 
 def normalize_url(url):
-    parsed = URL(url)
-    if parsed.host is None: return None
-    hostname = parsed.host.lower()
-    if hostname.startswith("www."):
-        hostname = hostname[4:]
-    return hostname.split('.')[0]
+    try:
+        parsed = URL(url)
+        if parsed.host is None: return None
+        hostname = parsed.host.lower()
+        if hostname.startswith("www."):
+            hostname = hostname[4:]
+        return hostname.split('.')[0]
+    except:
+        return None
 
-
-async def check(session, url, retries=3):
+async def check_website(session, url, retries=2):
     original_url = url
-    url = ensure_scheme(url)
+    target_url = ensure_scheme(url)
+    
+    if not target_url:
+        return {"website": original_url, "status": "Invalid URL", "redirect_url": None, "timestamp": datetime.now()}
+
     for attempt in range(retries + 1):
         try:
             headers = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
-            async with session.get(url, timeout=TIMEOUT, allow_redirects=False, headers=headers) as response:
+            async with session.get(target_url, timeout=TIMEOUT, allow_redirects=False, headers=headers) as response:
                 code = response.status
+                
                 if 200 <= code < 300:
-                    return {"website": original_url, "status": f"Working {code}",
-                            "redirect_url": None, "createddate": datetime.now()}
+                    return {"website": original_url, "status": f"Working {code}", "redirect_url": None, "timestamp": datetime.now()}
+                
                 elif 300 <= code < 400:
-                    redirect_url = str(URL(url).join(URL(response.headers.get("Location", ""))))
-                    if normalize_url(url) == normalize_url(redirect_url):
-                        return {"website": original_url, "status": f"Working {code}",
-                                "redirect_url": None, "createddate": datetime.now()}
-                    return {"website": original_url, "status": f"Redirected {code}",
-                            "redirect_url": redirect_url, "createddate": datetime.now()}
+                    location = response.headers.get("Location", "")
+                    redirect_url = str(URL(target_url).join(URL(location)))
+                    
+                    # If it's just a protocol change (http to https), mark as working
+                    if normalize_url(target_url) == normalize_url(redirect_url):
+                        return {"website": original_url, "status": f"Working {code}", "redirect_url": None, "timestamp": datetime.now()}
+                    
+                    return {"website": original_url, "status": f"Redirected {code}", "redirect_url": redirect_url, "timestamp": datetime.now()}
+                
                 else:
                     status = f"Non Working {code}" if code not in {401, 403, 429} else f"Working but Restricted {code}"
-                    return {"website": original_url, "status": status, "redirect_url": None,
-                            "createddate": datetime.now()}
+                    return {"website": original_url, "status": status, "redirect_url": None, "timestamp": datetime.now()}
+                    
         except Exception as e:
             if attempt < retries:
                 await asyncio.sleep(1)
                 continue
-            return {"website": original_url, "status": f"Not Able to Verify - {type(e).__name__}",
-                    "redirect_url": None, "createddate": datetime.now()}
-    return {"website": original_url, "status": "Not Able to Verify", "redirect_url": None,
-            "createddate": datetime.now()}
+            return {"website": original_url, "status": f"Not Able to Verify - {type(e).__name__}", "redirect_url": None, "timestamp": datetime.now()}
+            
+    return {"website": original_url, "status": "Not Able to Verify", "redirect_url": None, "timestamp": datetime.now()}
 
-
-def sync_check_fallback(url):
+def sync_fallback(url):
     try:
-        response = requests.get(ensure_scheme(url), timeout=25, verify=False)
-        return {"website": url, "status": f"Working {response.status_code}", "redirect_url": None,
-                "createddate": datetime.now()}
+        target = ensure_scheme(url)
+        response = requests.get(target, timeout=20, verify=False, headers={"User-Agent": "Mozilla/5.0"})
+        return {"website": url, "status": f"Working {response.status_code} (Sync)", "redirect_url": None, "timestamp": datetime.now()}
     except Exception:
-        return {"website": url, "status": "Non Working (Final)", "redirect_url": None,
-                "createddate": datetime.now()}
+        return {"website": url, "status": "Non Working (Final)", "redirect_url": None, "timestamp": datetime.now()}
 
+# --- PROCESSING ENGINE ---
 
-# --- CORE PROCESSING LOGIC ---
-
-async def run_validation(records, progress_bar, status_text):
+async def run_bulk_validation(urls, progress_bar, status_text):
     connector = aiohttp.TCPConnector(limit=CONCURRENCY, ssl=False)
     timeout = aiohttp.ClientTimeout(total=TIMEOUT)
-    all_results = []
-
+    results = []
+    
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        tasks = [check(session, row.website) for row in records]
+        tasks = [check_website(session, url) for url in urls]
         for i, completed_task in enumerate(asyncio.as_completed(tasks)):
             res = await completed_task
-            all_results.append(res)
-            # Update UI Progress
-            if i % 10 == 0:
-                pct = (i + 1) / len(records)
-                progress_bar.progress(pct)
-                status_text.text(f"Processed {i + 1} of {len(records)} URLs...")
-    return all_results
-
+            results.append(res)
+            if i % 5 == 0:
+                progress_bar.progress((i + 1) / len(urls))
+                status_text.text(f"Validated {i+1} of {len(urls)} websites...")
+    return results
 
 # --- STREAMLIT UI ---
 
-st.set_page_config(page_title="Salesforce URL Validator", page_icon="🔍")
+st.set_page_config(page_title="Website Validator", page_icon="🌐")
 
-st.title("🔍 Salesforce Website Validator")
-st.markdown("""
-This tool validates account websites. 
-1. **Upload** your CSV (must have `website`column).
-2. **Click** Start.
-3. **Download** the results.
-""")
+st.title("🌐 Website Status Validator")
+st.markdown("Upload a CSV containing a column named **'website'** to check status.")
 
-uploaded_file = st.file_uploader("Upload CSV File", type="csv")
+uploaded_file = st.file_uploader("Upload CSV", type="csv")
 
 if uploaded_file:
     df = pd.read_csv(uploaded_file)
-    st.write(f"📊 Total Records Found: **{len(df)}**")
+    
+    if 'website' not in df.columns:
+        st.error("Error: CSV must contain a column named 'website'.")
+    else:
+        urls = df['website'].dropna().unique().tolist()
+        st.info(f"Found {len(urls)} unique websites to validate.")
+        
+        if st.button("🚀 Start Validation"):
+            status_text = st.empty()
+            progress_bar = st.progress(0)
+            
+            # Phase 1: Async
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            with st.spinner("Batch processing URLs..."):
+                results = loop.run_until_complete(run_bulk_validation(urls, progress_bar, status_text))
+                
+                # Phase 2: Sync Fallback for failures
+                unverified = [r for r in results if "Not Able to Verify" in r["status"]]
+                if unverified:
+                    status_text.text(f"Retrying {len(unverified)} difficult URLs with secondary method...")
+                    with ThreadPoolExecutor(max_workers=15) as executor:
+                        futures = [executor.submit(sync_fallback, r['website']) for r in unverified]
+                        sync_results = [f.result() for f in as_completed(futures)]
+                    
+                    # Update results list
+                    results = [r for r in results if r['website'] not in [x['website'] for x in unverified]]
+                    results.extend(sync_results)
 
-    if st.button("🚀 Start Validation Process"):
-        # Setup UI components for progress
-        status_text = st.empty()
-        progress_bar = st.progress(0)
-
-        # Prepare data
-        records = list(df.itertuples(index=False))
-
-        # Execute Async Logic
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-        with st.spinner("Validating URLs..."):
-            results = loop.run_until_complete(run_validation(records, progress_bar, status_text))
-
-            # Fallback for "Not Able to Verify"
-            not_verified = [r for r in results if "Not Able to Verify" in r["status"]]
-            if not_verified:
-                status_text.text(f"Running secondary check on {len(not_verified)} difficult URLs...")
-                with ThreadPoolExecutor(max_workers=20) as executor:
-                    futures = [executor.submit(sync_check_fallback, r['website']) for r in not_verified]
-                    sync_results = [f.result() for f in as_completed(futures)]
-
-                # Replace unverified with sync results
-                results.extend(sync_results)
-
-        status_text.success("✅ Validation Complete!")
-
-        # Display Preview & Download
-        result_df = pd.DataFrame(results)
-        st.dataframe(result_df.head(10))
-
-        csv_buffer = result_df.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="📥 Download Results CSV",
-            data=csv_buffer,
-            file_name=f"Validation_Results_{datetime.now().strftime('%Y%m%d')}.csv",
-            mime="text/csv"
-        )
+            status_text.success("✅ Validation Finished!")
+            
+            # Show and Download Results
+            res_df = pd.DataFrame(results)
+            st.dataframe(res_df)
+            
+            csv_out = res_df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="📥 Download Report",
+                data=csv_out,
+                file_name=f"website_validation_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv"
+            )
