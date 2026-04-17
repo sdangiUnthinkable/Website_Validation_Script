@@ -1,0 +1,6 @@
+aiohttp
+pandas
+nest_asyncio
+yarl
+requests
+streamlit
